@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 import librosa
 import torch
 from datasets import load_dataset
+from peft import LoraConfig, get_peft_model
 from qwen_asr import Qwen3ASRModel
 from transformers import (GenerationConfig, Trainer, TrainerCallback,
                           TrainingArguments)
@@ -60,6 +61,9 @@ def patch_outer_forward(model):
     cls.forward = forward
     cls._forward_patched = True
 
+
+# LLM の注意層と MLP だけに LoRA をかける。音声エンコーダにも q_proj 等の同名の層があるので、パスで絞る
+LORA_TARGET = r"thinker\.model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
 
 _CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
 
@@ -232,6 +236,17 @@ def parse_args():
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--save_total_limit", type=int, default=5)
 
+    # Memory / speed
+    p.add_argument("--freeze_audio_tower", type=int, default=0)
+    p.add_argument("--gradient_checkpointing", type=int, default=0)
+    p.add_argument("--attn_implementation", type=str, default="sdpa")
+
+    # LoRA
+    p.add_argument("--lora", type=int, default=0)
+    p.add_argument("--lora_r", type=int, default=16)
+    p.add_argument("--lora_alpha", type=int, default=32)
+    p.add_argument("--lora_dropout", type=float, default=0.05)
+
     # Resume
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
@@ -250,12 +265,26 @@ def main():
         args_cli.model_path,
         dtype=torch.bfloat16 if use_bf16 else torch.float16,
         device_map=None,
+        attn_implementation=args_cli.attn_implementation,
     )
     model = asr_wrapper.model
     processor = asr_wrapper.processor
 
     patch_outer_forward(model)
     model.generation_config = GenerationConfig.from_model_config(model.config)
+
+    if args_cli.freeze_audio_tower == 1:
+        model.thinker.audio_tower.requires_grad_(False)
+    if args_cli.lora == 1:
+        model = get_peft_model(model, LoraConfig(
+            r=args_cli.lora_r,
+            lora_alpha=args_cli.lora_alpha,
+            lora_dropout=args_cli.lora_dropout,
+            target_modules=LORA_TARGET,
+        ))
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"[params] trainable {trainable:,} / total {total:,}")
 
     raw_ds = load_dataset(
         "json",
@@ -299,6 +328,8 @@ def main():
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
         report_to="none",
+        gradient_checkpointing=(args_cli.gradient_checkpointing == 1),
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
     trainer = CastFloatInputsTrainer(
@@ -321,6 +352,12 @@ def main():
         trainer.train(resume_from_checkpoint=resume_from)
     else:
         trainer.train()
+
+    if args_cli.lora == 1 and trainer.args.process_index == 0:
+        merged_dir = os.path.join(training_args.output_dir, "merged")
+        model.merge_and_unload().save_pretrained(merged_dir)
+        copy_required_hf_files_for_qwen_asr(args_cli.model_path, merged_dir)
+        print(f"[lora] merged model saved to {merged_dir}")
 
 
 if __name__ == "__main__":
