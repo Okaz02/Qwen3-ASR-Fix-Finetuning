@@ -13,16 +13,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import argparse
 import os
 import re
 import shutil
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import librosa
 import torch
-from datasets import load_dataset
+from datasets import Dataset, DatasetDict
 from peft import LoraConfig, get_peft_model
 from qwen_asr import Qwen3ASRModel
 from transformers import (GenerationConfig, Trainer, TrainerCallback,
@@ -119,6 +118,7 @@ def make_preprocess_fn_prefix_only(processor):
 class DataCollatorForQwen3ASRFinetuning:
     processor: Any
     sampling_rate: int = 16000
+    load_audio: Callable = load_audio
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         audio_paths = [f["audio"] for f in features]
@@ -127,7 +127,7 @@ class DataCollatorForQwen3ASRFinetuning:
 
         eos = self.processor.tokenizer.eos_token or ""
         full_texts = [pfx + tgt + eos for pfx, tgt in zip(prefix_texts, targets)]
-        audios = [load_audio(p, sr=self.sampling_rate) for p in audio_paths]
+        audios = [self.load_audio(p, self.sampling_rate) for p in audio_paths]
 
         full_inputs = self.processor(
             text=full_texts,
@@ -204,68 +204,54 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
         return control
 
 
-def parse_args():
-    p = argparse.ArgumentParser("Qwen3-ASR Finetuning")
+@dataclass
+class TrainConfig:
+    model_path: str = "Qwen/Qwen3-ASR-1.7B"
+    output_dir: str = "./qwen3-asr-finetuning-out"
+    sr: int = 16000
 
-    # Paths
-    p.add_argument("--model_path", type=str, default="Qwen/Qwen3-ASR-1.7B")
-    p.add_argument("--train_file", type=str, default="train.jsonl")
-    p.add_argument("--eval_file", type=str, default="")
-    p.add_argument("--output_dir", type=str, default="./qwen3-asr-finetuning-out")
+    batch_size: int = 32
+    grad_acc: int = 4
+    lr: float = 2e-5
+    epochs: float = 1
+    log_steps: int = 10
+    lr_scheduler_type: str = "linear"
+    warmup_ratio: float = 0.02
 
-    # Audio
-    p.add_argument("--sr", type=int, default=16000)
+    num_workers: int = 4
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 2
 
-    # Train hyper-params
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--grad_acc", type=int, default=4)
-    p.add_argument("--lr", type=float, default=2e-5)
-    p.add_argument("--epochs", type=float, default=1)
-    p.add_argument("--log_steps", type=int, default=10)
-    p.add_argument("--lr_scheduler_type", type=str, default="linear")
-    p.add_argument("--warmup_ratio", type=float, default=0.02)
+    save_strategy: str = "steps"
+    save_steps: int = 200
+    save_total_limit: int = 5
 
-    # DataLoader
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--pin_memory", type=int, default=1)
-    p.add_argument("--persistent_workers", type=int, default=1)
-    p.add_argument("--prefetch_factor", type=int, default=2)
+    freeze_audio_tower: bool = False
+    gradient_checkpointing: bool = False
+    attn_implementation: str = "sdpa"
 
-    # Save
-    p.add_argument("--save_strategy", type=str, default="steps")
-    p.add_argument("--save_steps", type=int, default=200)
-    p.add_argument("--save_total_limit", type=int, default=5)
+    lora: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
 
-    # Memory / speed
-    p.add_argument("--freeze_audio_tower", type=int, default=0)
-    p.add_argument("--gradient_checkpointing", type=int, default=0)
-    p.add_argument("--attn_implementation", type=str, default="sdpa")
-
-    # LoRA
-    p.add_argument("--lora", type=int, default=0)
-    p.add_argument("--lora_r", type=int, default=16)
-    p.add_argument("--lora_alpha", type=int, default=32)
-    p.add_argument("--lora_dropout", type=float, default=0.05)
-
-    # Resume
-    p.add_argument("--resume_from", type=str, default="")
-    p.add_argument("--resume", type=int, default=0)
-
-    return p.parse_args()
+    resume_from: str = ""
+    resume: bool = False
 
 
-def main():
-    args_cli = parse_args()
-
-    if not args_cli.train_file:
-        raise ValueError("TRAIN_FILE is required (json/jsonl). Needs fields: audio, text, optional prompt")
+def train(cfg: TrainConfig, train_items: List[Dict[str, Any]], load_audio: Callable = load_audio,
+          eval_items: Optional[List[Dict[str, Any]]] = None):
+    """train_items / eval_items は {"audio": ..., "text": ..., "prompt"(任意): ...} のリスト。
+    load_audio(audio, sr) は "audio" の値を受け取り、sr で読み込んだ1次元の波形を返す。
+    DataLoader のワーカーの中で呼ばれるので、取得は学習と並行して進む。"""
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
     asr_wrapper = Qwen3ASRModel.from_pretrained(
-        args_cli.model_path,
+        cfg.model_path,
         dtype=torch.bfloat16 if use_bf16 else torch.float16,
         device_map=None,
-        attn_implementation=args_cli.attn_implementation,
+        attn_implementation=cfg.attn_implementation,
     )
     model = asr_wrapper.model
     processor = asr_wrapper.processor
@@ -273,26 +259,23 @@ def main():
     patch_outer_forward(model)
     model.generation_config = GenerationConfig.from_model_config(model.config)
 
-    if args_cli.freeze_audio_tower == 1:
+    if cfg.freeze_audio_tower:
         model.thinker.audio_tower.requires_grad_(False)
-    if args_cli.lora == 1:
+    if cfg.lora:
         model = get_peft_model(model, LoraConfig(
-            r=args_cli.lora_r,
-            lora_alpha=args_cli.lora_alpha,
-            lora_dropout=args_cli.lora_dropout,
+            r=cfg.lora_r,
+            lora_alpha=cfg.lora_alpha,
+            lora_dropout=cfg.lora_dropout,
             target_modules=LORA_TARGET,
         ))
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"[params] trainable {trainable:,} / total {total:,}")
 
-    raw_ds = load_dataset(
-        "json",
-        data_files={
-            "train": args_cli.train_file,
-            **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
-        },
-    )
+    raw_ds = DatasetDict({
+        "train": Dataset.from_list(train_items),
+        **({"validation": Dataset.from_list(eval_items)} if eval_items else {}),
+    })
     ds = raw_ds.map(make_preprocess_fn_prefix_only(processor), num_proc=1)
 
     keep = {"prompt", "audio", "target", "prefix_text"}
@@ -301,34 +284,34 @@ def main():
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
-    collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=args_cli.sr)
+    collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=cfg.sr, load_audio=load_audio)
 
     training_args = TrainingArguments(
-        output_dir=args_cli.output_dir,
-        per_device_train_batch_size=args_cli.batch_size,
-        gradient_accumulation_steps=args_cli.grad_acc,
-        learning_rate=args_cli.lr,
-        num_train_epochs=args_cli.epochs,
-        logging_steps=args_cli.log_steps,
-        lr_scheduler_type=args_cli.lr_scheduler_type,
-        warmup_ratio=args_cli.warmup_ratio,
-        dataloader_num_workers=args_cli.num_workers,
-        dataloader_pin_memory=(args_cli.pin_memory == 1),
-        dataloader_persistent_workers=(args_cli.persistent_workers == 1),
-        dataloader_prefetch_factor=args_cli.prefetch_factor if args_cli.num_workers > 0 else None,
-        save_strategy=args_cli.save_strategy,
-        save_steps=args_cli.save_steps,
-        save_total_limit=args_cli.save_total_limit,
+        output_dir=cfg.output_dir,
+        per_device_train_batch_size=cfg.batch_size,
+        gradient_accumulation_steps=cfg.grad_acc,
+        learning_rate=cfg.lr,
+        num_train_epochs=cfg.epochs,
+        logging_steps=cfg.log_steps,
+        lr_scheduler_type=cfg.lr_scheduler_type,
+        warmup_ratio=cfg.warmup_ratio,
+        dataloader_num_workers=cfg.num_workers,
+        dataloader_pin_memory=cfg.pin_memory,
+        dataloader_persistent_workers=cfg.persistent_workers,
+        dataloader_prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+        save_strategy=cfg.save_strategy,
+        save_steps=cfg.save_steps,
+        save_total_limit=cfg.save_total_limit,
         save_safetensors=True,
         eval_strategy="steps",
-        eval_steps=args_cli.save_steps,
-        do_eval=bool(args_cli.eval_file),
+        eval_steps=cfg.save_steps,
+        do_eval=bool(eval_items),
         bf16=use_bf16,
         fp16=not use_bf16,
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
         report_to="none",
-        gradient_checkpointing=(args_cli.gradient_checkpointing == 1),
+        gradient_checkpointing=cfg.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
@@ -339,11 +322,11 @@ def main():
         eval_dataset=ds.get("validation", None),
         data_collator=collator,
         tokenizer=processor.tokenizer,
-        callbacks=[MakeEveryCheckpointInferableCallback(base_model_path=args_cli.model_path)],
+        callbacks=[MakeEveryCheckpointInferableCallback(base_model_path=cfg.model_path)],
     )
 
-    resume_from = (args_cli.resume_from or "").strip()
-    if not resume_from and args_cli.resume == 1:
+    resume_from = (cfg.resume_from or "").strip()
+    if not resume_from and cfg.resume:
         resume_from = find_latest_checkpoint(training_args.output_dir) or ""
 
     if resume_from:
@@ -353,12 +336,8 @@ def main():
     else:
         trainer.train()
 
-    if args_cli.lora == 1 and trainer.args.process_index == 0:
+    if cfg.lora and trainer.args.process_index == 0:
         merged_dir = os.path.join(training_args.output_dir, "merged")
         model.merge_and_unload().save_pretrained(merged_dir)
-        copy_required_hf_files_for_qwen_asr(args_cli.model_path, merged_dir)
+        copy_required_hf_files_for_qwen_asr(cfg.model_path, merged_dir)
         print(f"[lora] merged model saved to {merged_dir}")
-
-
-if __name__ == "__main__":
-    main()
