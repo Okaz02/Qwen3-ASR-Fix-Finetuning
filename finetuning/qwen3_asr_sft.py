@@ -17,11 +17,9 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-import librosa
 import torch
-from datasets import Dataset, DatasetDict
 from peft import LoraConfig, get_peft_model
 from qwen_asr import Qwen3ASRModel
 from transformers import (GenerationConfig, Trainer, TrainerCallback,
@@ -84,9 +82,7 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     return best_path
 
 
-def load_audio(path: str, sr: int = 16000):
-    wav, _ = librosa.load(path, sr=sr, mono=True)
-    return wav
+SAMPLING_RATE = 16000  # データセットが返す波形のサンプリング周波数
 
 
 def build_prefix_messages(prompt: str, audio_array):
@@ -96,38 +92,20 @@ def build_prefix_messages(prompt: str, audio_array):
     ]
 
 
-def make_preprocess_fn_prefix_only(processor):
-    def _preprocess(ex: Dict[str, Any]) -> Dict[str, Any]:
-        prompt = ex.get("prompt", "")
-        dummy_audio = None
-        prefix_msgs = build_prefix_messages(prompt, dummy_audio)
-        prefix_text = processor.apply_chat_template(
-            [prefix_msgs], add_generation_prompt=True, tokenize=False
-        )[0]
-        return {
-            "prompt": prompt,
-            "audio": ex["audio"],
-            "target": ex["text"],
-            "prefix_text": prefix_text,
-        }
-
-    return _preprocess
-
-
 @dataclass
 class DataCollatorForQwen3ASRFinetuning:
     processor: Any
-    sampling_rate: int = 16000
-    load_audio: Callable = load_audio
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        audio_paths = [f["audio"] for f in features]
-        prefix_texts = [f["prefix_text"] for f in features]
-        targets = [f["target"] for f in features]
+        prefix_texts = self.processor.apply_chat_template(
+            [build_prefix_messages(f.get("prompt", ""), None) for f in features],
+            add_generation_prompt=True, tokenize=False,
+        )
+        targets = [f["text"] for f in features]
+        audios = [f["audio"] for f in features]
 
         eos = self.processor.tokenizer.eos_token or ""
         full_texts = [pfx + tgt + eos for pfx, tgt in zip(prefix_texts, targets)]
-        audios = [self.load_audio(p, self.sampling_rate) for p in audio_paths]
 
         full_inputs = self.processor(
             text=full_texts,
@@ -208,7 +186,6 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
 class TrainConfig:
     model_path: str = "Qwen/Qwen3-ASR-1.7B"
     output_dir: str = "./qwen3-asr-finetuning-out"
-    sr: int = 16000
 
     batch_size: int = 32
     grad_acc: int = 4
@@ -240,11 +217,10 @@ class TrainConfig:
     resume: bool = False
 
 
-def train(cfg: TrainConfig, train_items: List[Dict[str, Any]], load_audio: Callable = load_audio,
-          eval_items: Optional[List[Dict[str, Any]]] = None):
-    """train_items / eval_items は {"audio": ..., "text": ..., "prompt"(任意): ...} のリスト。
-    load_audio(audio, sr) は "audio" の値を受け取り、sr で読み込んだ1次元の波形を返す。
-    DataLoader のワーカーの中で呼ばれるので、取得は学習と並行して進む。"""
+def train(cfg: TrainConfig, train_dataset, eval_dataset=None):
+    """train_dataset / eval_dataset は len() と [i] が使えるもの。
+    [i] は {"audio": SAMPLING_RATE の1次元波形, "text": 正解テキスト, "prompt"(任意)} を返す。
+    [i] は DataLoader のワーカーの中で呼ばれるので、音声の取得は学習と並行して進む。"""
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
     asr_wrapper = Qwen3ASRModel.from_pretrained(
@@ -272,19 +248,7 @@ def train(cfg: TrainConfig, train_items: List[Dict[str, Any]], load_audio: Calla
     total = sum(p.numel() for p in model.parameters())
     print(f"[params] trainable {trainable:,} / total {total:,}")
 
-    raw_ds = DatasetDict({
-        "train": Dataset.from_list(train_items),
-        **({"validation": Dataset.from_list(eval_items)} if eval_items else {}),
-    })
-    ds = raw_ds.map(make_preprocess_fn_prefix_only(processor), num_proc=1)
-
-    keep = {"prompt", "audio", "target", "prefix_text"}
-    for split in ds.keys():
-        drop = [c for c in ds[split].column_names if c not in keep]
-        if drop:
-            ds[split] = ds[split].remove_columns(drop)
-
-    collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=cfg.sr, load_audio=load_audio)
+    collator = DataCollatorForQwen3ASRFinetuning(processor=processor)
 
     training_args = TrainingArguments(
         output_dir=cfg.output_dir,
@@ -305,7 +269,7 @@ def train(cfg: TrainConfig, train_items: List[Dict[str, Any]], load_audio: Calla
         save_safetensors=True,
         eval_strategy="steps",
         eval_steps=cfg.save_steps,
-        do_eval=bool(eval_items),
+        do_eval=eval_dataset is not None,
         bf16=use_bf16,
         fp16=not use_bf16,
         ddp_find_unused_parameters=False,
@@ -318,8 +282,8 @@ def train(cfg: TrainConfig, train_items: List[Dict[str, Any]], load_audio: Calla
     trainer = CastFloatInputsTrainer(
         model=model,
         args=training_args,
-        train_dataset=ds["train"],
-        eval_dataset=ds.get("validation", None),
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=collator,
         tokenizer=processor.tokenizer,
         callbacks=[MakeEveryCheckpointInferableCallback(base_model_path=cfg.model_path)],
@@ -341,3 +305,4 @@ def train(cfg: TrainConfig, train_items: List[Dict[str, Any]], load_audio: Calla
         model.merge_and_unload().save_pretrained(merged_dir)
         copy_required_hf_files_for_qwen_asr(cfg.model_path, merged_dir)
         print(f"[lora] merged model saved to {merged_dir}")
+
